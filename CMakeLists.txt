@@ -87,6 +87,7 @@ option(WHISPER_ALL_WARNINGS_3RD_PARTY "whisper: enable all compiler warnings in 
 # build
 option(WHISPER_FATAL_WARNINGS   "whisper: enable -Werror flag"                    OFF)
 option(WHISPER_USE_SYSTEM_GGML  "whisper: use system-installed GGML library"      OFF)
+set(WHISPER_GGML_DIR "" CACHE PATH "whisper: build against the ggml in this directory instead of the bundled one")
 option(WHISPER_USE_SYSTEM_LLAMA "whisper: use system-installed llama.cpp library" OFF)
 
 if (WHISPER_USE_SYSTEM_LLAMA AND NOT WHISPER_USE_SYSTEM_GGML)
@@ -164,6 +165,11 @@ if (NOT TARGET ggml)
             message(FATAL_ERROR "System-installed GGML library not found.")
         endif()
         add_library(ggml ALIAS ggml::ggml)
+    elseif (WHISPER_GGML_DIR)
+        # another checkout's ggml, built here: what a model needs is the ggml that has its types and
+        # kernels, and the bundled copy stays in the tree untouched
+        message(STATUS "whisper: ggml from ${WHISPER_GGML_DIR}")
+        add_subdirectory(${WHISPER_GGML_DIR} ggml)
     else()
         add_subdirectory(ggml)
         if(WIN32)

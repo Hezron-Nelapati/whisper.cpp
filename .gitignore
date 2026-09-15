@@ -68,3 +68,7 @@ local.properties
 
 # AGENTS
 .pi/SYSTEM.md
+
+# built against another checkout ggml, and the bundled copy set aside
+ggml.bundled/
+build-config*.log
