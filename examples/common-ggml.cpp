@@ -14,6 +14,8 @@ static const std::map<std::string, enum ggml_ftype> GGML_FTYPE_MAP = {
     {"q4_k", GGML_FTYPE_MOSTLY_Q4_K},
     {"q5_k", GGML_FTYPE_MOSTLY_Q5_K},
     {"q6_k", GGML_FTYPE_MOSTLY_Q6_K},
+    {"neuron_v4", GGML_FTYPE_MOSTLY_NEURON_V4},
+    {"neuron_l4", GGML_FTYPE_MOSTLY_NEURON_L4},
 };
 
 void ggml_print_ftypes(FILE * fp) {
@@ -24,15 +26,16 @@ void ggml_print_ftypes(FILE * fp) {
 
 enum ggml_ftype ggml_parse_ftype(const char * str) {
     enum ggml_ftype ftype;
-    if (str[0] == 'q') {
-        const auto it = GGML_FTYPE_MAP.find(str);
-        if (it == GGML_FTYPE_MAP.end()) {
-            fprintf(stderr, "%s: unknown ftype '%s'\n", __func__, str);
-            return GGML_FTYPE_UNKNOWN;
-        }
+    // Names first, numbers only if the string is one. Keying on a leading 'q' sent every
+    // non-q name through atoi, so "neuron_v4" silently became 0 (all f32).
+    const auto it = GGML_FTYPE_MAP.find(str);
+    if (it != GGML_FTYPE_MAP.end()) {
         ftype = it->second;
-    } else {
+    } else if (str[0] >= '0' && str[0] <= '9') {
         ftype = (enum ggml_ftype) atoi(str);
+    } else {
+        fprintf(stderr, "%s: unknown ftype '%s'\n", __func__, str);
+        return GGML_FTYPE_UNKNOWN;
     }
 
     return ftype;
@@ -58,6 +61,8 @@ bool ggml_common_quantize_0(
         case GGML_FTYPE_MOSTLY_Q4_K: qtype = GGML_TYPE_Q4_K; break;
         case GGML_FTYPE_MOSTLY_Q5_K: qtype = GGML_TYPE_Q5_K; break;
         case GGML_FTYPE_MOSTLY_Q6_K: qtype = GGML_TYPE_Q6_K; break;
+        case GGML_FTYPE_MOSTLY_NEURON_V4: qtype = GGML_TYPE_NEURON_V4; break;
+        case GGML_FTYPE_MOSTLY_NEURON_L4: qtype = GGML_TYPE_NEURON_L4; break;
         case GGML_FTYPE_UNKNOWN:
         case GGML_FTYPE_ALL_F32:
         case GGML_FTYPE_MOSTLY_F16:
@@ -191,6 +196,8 @@ bool ggml_common_quantize_0(
                 case GGML_TYPE_Q4_K:
                 case GGML_TYPE_Q5_K:
                 case GGML_TYPE_Q6_K:
+                case GGML_TYPE_NEURON_V4:
+                case GGML_TYPE_NEURON_L4:
                     {
                         cur_size = ggml_quantize_chunk((ggml_type) ttype, data_f32.data(), work.data(), 0, nelements/ne[0], ne[0], nullptr);
                     } break;
