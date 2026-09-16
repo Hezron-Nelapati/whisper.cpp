@@ -418,16 +418,16 @@ struct parakeet_state {
     int64_t t_sample_us = 0;
     int64_t t_encode_us = 0;
     int64_t t_decode_us = 0;
-    int64_t t_predict_us = 0;
-    int64_t t_predict_build_us   = 0; // time spent building the prediction graph
-    int64_t t_predict_alloc_us   = 0; // time spent in ggml_backend_sched_alloc_graph
-    int64_t t_predict_compute_us = 0; // time spent in ggml_graph_compute_helper
+    int64_t t_decode_build_us   = 0; // time spent building the decode step graph
+    int64_t t_decode_alloc_us   = 0; // time spent in ggml_backend_sched_alloc_graph
+    int64_t t_decode_compute_us = 0; // time spent in ggml_graph_compute_helper
     int64_t t_mel_us = 0;
 
     int32_t n_sample = 0; // number of tokens sampled
     int32_t n_encode = 0; // number of encoder calls
-    int32_t n_decode = 0; // number of decoder calls with n_tokens == 1  (text-generation)
-    int32_t n_predict = 0; // number of prediction network calls
+    int32_t n_decode = 0; // number of decode steps, each one graph over a span of encoder frames
+    int32_t n_decode_frames = 0; // encoder frames passed through the joint network
+    int32_t n_predict = 0; // number of prediction network steps, run inside decode steps
     int32_t n_fail_p = 0; // number of logprob threshold failures
     int32_t n_fail_h = 0; // number of entropy threshold failures
 
@@ -444,6 +444,7 @@ struct parakeet_state {
 
     // outputs from encoder stages
     struct ggml_tensor * enc_out     = nullptr;
+    struct ggml_tensor * enc_proj    = nullptr; // enc_out projected to the joint dimension
     struct ggml_tensor * pred_out    = nullptr;
 
     std::vector<uint8_t> enc_out_buf;
@@ -632,21 +633,6 @@ static void parakeet_batch_free(struct parakeet_batch batch) {
     if (batch.logits)   free(batch.logits);
 }
 
-static void parakeet_batch_prep_legacy(parakeet_batch & batch, const parakeet_token * tokens, int n_tokens, int n_past, int seq_id) {
-    batch.n_tokens = n_tokens;
-    for (int i = 0; i < n_tokens; ++i) {
-        if (tokens) {
-            batch.token[i] = tokens[i];
-        }
-        batch.pos     [i]    = n_past + i;
-        batch.n_seq_id[i]    = 1;
-        batch.seq_id  [i][0] = seq_id;
-        batch.logits  [i]    = 0;
-    }
-    batch.logits[n_tokens - 1] = 1;
-}
-
-
 static size_t parakeet_sched_size(struct parakeet_sched & allocr) {
     size_t size = allocr.meta.size();
     for (int i = 0; i < ggml_backend_sched_get_n_backends(allocr.sched); ++i) {
@@ -803,8 +789,9 @@ static bool parakeet_enc_state_init(
                struct parakeet_state & pstate,
                       ggml_backend_t   backend,
                                  int   n_audio_state,
+                                 int   n_joint,
                                  int   n_frames_max) {
-    pstate.enc_out_buf.resize(ggml_tensor_overhead());
+    pstate.enc_out_buf.resize(2 * ggml_tensor_overhead());
 
     struct ggml_init_params params = {
         /*.mem_size   =*/ pstate.enc_out_buf.size(),
@@ -818,7 +805,8 @@ static bool parakeet_enc_state_init(
         return false;
     }
 
-    pstate.enc_out = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_audio_state, n_frames_max);
+    pstate.enc_out  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_audio_state, n_frames_max);
+    pstate.enc_proj = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_joint,       n_frames_max);
     pstate.enc_out_buffer = ggml_backend_alloc_ctx_tensors(ctx, backend);
     if (!pstate.enc_out_buffer) {
         PARAKEET_LOG_ERROR("%s: failed to allocate memory for enc_out tensor\n", __func__);
@@ -2225,7 +2213,9 @@ static bool parakeet_ensure_enc_out(
     ggml_backend_buffer_free(pstate.enc_out_buffer);
     pstate.enc_out_buffer = nullptr;
     pstate.enc_out = nullptr;
-    return parakeet_enc_state_init(pstate, pstate.backends[0], pctx.model.hparams.n_audio_state, n_frames);
+    pstate.enc_proj = nullptr;
+    return parakeet_enc_state_init(pstate, pstate.backends[0], pctx.model.hparams.n_audio_state,
+            pctx.model.joint.enc_w->ne[1], n_frames);
 }
 
 static bool parakeet_ensure_encode_sched(
@@ -2332,33 +2322,33 @@ static struct ggml_tensor * parakeet_build_graph_lstm_layer(
     return h_new;
 }
 
-static struct ggml_cgraph * parakeet_build_graph_prediction(
+// Frames per decode step: as many joint rows as match one prediction network step in weight
+// multiply-adds, so the rows past the next emitted token never cost more than the step's own predictor.
+static int parakeet_decode_span(const parakeet_model & model) {
+    int64_t n_pred = ggml_nelements(model.joint.pred_w);
+    for (const auto & layer : model.prediction.lstm_layer) {
+        n_pred += ggml_nelements(layer.ih_w) + ggml_nelements(layer.hh_w);
+    }
+    const int64_t n_row = ggml_nelements(model.joint.net_w);
+    const int span = std::max<int64_t>(1, (n_pred + n_row / 2) / n_row);
+    return span;
+}
+
+// Prediction network for one token, projected to the joint dimension. The result is also kept in
+// pstate.pred_out for later steps that reuse it.
+static struct ggml_tensor * parakeet_build_prediction(
+      struct ggml_context * ctx0,
+       struct ggml_cgraph * gf,
          parakeet_context & pctx,
-           parakeet_state & pstate,
-     const parakeet_batch & batch,
-                    bool   worst_case) {
-    GGML_UNUSED(worst_case);
+           parakeet_state & pstate) {
     const auto & model   = pctx.model;
     const auto & hparams = model.hparams;
-    const int n_tokens   = batch.n_tokens;
 
-    struct ggml_init_params params = {
-        /*.mem_size   =*/ pstate.sched_decode.meta.size(),
-        /*.mem_buffer =*/ pstate.sched_decode.meta.data(),
-        /*.no_alloc   =*/ true,
-    };
-
-    struct ggml_context * ctx0 = ggml_init(params);
-    ggml_cgraph * gf = ggml_new_graph_custom(ctx0, PARAKEET_MAX_NODES, false);
-
-    // Prediction Network
-    struct ggml_tensor * token = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens);
+    struct ggml_tensor * token = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, 1);
     ggml_set_name(token, "token_inp");
     ggml_set_input(token);
 
-    struct ggml_tensor * token_embd = ggml_get_rows(ctx0, model.prediction.embed_w, token);
-
-    struct ggml_tensor * inpL = token_embd;
+    struct ggml_tensor * inpL = ggml_get_rows(ctx0, model.prediction.embed_w, token);
 
     for (int il = 0; il < hparams.n_pred_layers; ++il) {
         inpL = parakeet_build_graph_lstm_layer(ctx0, gf, inpL,
@@ -2369,28 +2359,23 @@ static struct ggml_cgraph * parakeet_build_graph_prediction(
                 pstate.lstm_state.layer[il].c_state,
                 il);
     }
+    ggml_format_name(inpL, "lstm_pred_out");
 
-    struct ggml_tensor * pred_out = inpL;
-    ggml_format_name(pred_out, "lstm_pred_out");
-
-    // Project the prediction network output to the joint network hidden dimension.
-    struct ggml_tensor * pred = ggml_mul_mat(ctx0, model.joint.pred_w, pred_out);
+    struct ggml_tensor * pred = ggml_mul_mat(ctx0, model.joint.pred_w, inpL);
     pred = ggml_add(ctx0, pred, model.joint.pred_b);
     ggml_set_name(pred, "h_pred");
 
     ggml_build_forward_expand(gf, ggml_cpy(ctx0, pred, pstate.pred_out));
 
-    ggml_free(ctx0);
-
-    return gf;
+    return pred;
 }
 
-static struct ggml_cgraph * parakeet_build_graph_joint(
+// The joint network's encoder projection does not depend on the predictor, so it runs once over all
+// n_frames encoder frames into pstate.enc_proj before the decode steps.
+static struct ggml_cgraph * parakeet_build_graph_enc_proj(
          parakeet_context & pctx,
            parakeet_state & pstate,
-     const parakeet_batch & batch,
-                     bool   worst_case) {
-    GGML_UNUSED(worst_case);
+                const int   n_frames) {
     const auto & model   = pctx.model;
     const auto & hparams = model.hparams;
 
@@ -2403,17 +2388,47 @@ static struct ggml_cgraph * parakeet_build_graph_joint(
     struct ggml_context * ctx0 = ggml_init(params);
     ggml_cgraph * gf = ggml_new_graph_custom(ctx0, PARAKEET_MAX_NODES, false);
 
-    struct ggml_tensor * pred = pstate.pred_out;
-    ggml_format_name(pred, "pred");
-
-    const int t_idx = batch.i_time[0];
-    struct ggml_tensor * enc_out = ggml_view_1d(ctx0, pstate.enc_out, hparams.n_audio_state,
-            (size_t) t_idx * pstate.enc_out->nb[1]);
+    struct ggml_tensor * enc_out = ggml_view_2d(ctx0, pstate.enc_out, hparams.n_audio_state, n_frames,
+            pstate.enc_out->nb[1], 0);
     ggml_format_name(enc_out, "enc_out_view");
 
-    // Project the encoder output to the joint network hidden dimension.
-    struct ggml_tensor * enc  = ggml_mul_mat(ctx0, model.joint.enc_w, enc_out);
+    struct ggml_tensor * enc = ggml_mul_mat(ctx0, model.joint.enc_w, enc_out);
     enc = ggml_add(ctx0, enc, model.joint.enc_b);
+    ggml_set_name(enc, "enc");
+
+    struct ggml_tensor * dst = ggml_view_2d(ctx0, pstate.enc_proj, pstate.enc_proj->ne[0], n_frames,
+            pstate.enc_proj->nb[1], 0);
+    ggml_build_forward_expand(gf, ggml_cpy(ctx0, enc, dst));
+
+    ggml_free(ctx0);
+
+    return gf;
+}
+
+// One decode step: optionally advance the prediction network by one token, then run the joint network
+// over encoder frames [t0, t0 + n_rows) against the predictor output. Greedy decoding leaves the
+// predictor unchanged across blanks, so one graph covers every frame up to the next emitted token.
+static struct ggml_cgraph * parakeet_build_graph_joint(
+         parakeet_context & pctx,
+           parakeet_state & pstate,
+                const int   t0,
+                const int   n_rows,
+               const bool   predict) {
+    const auto & model = pctx.model;
+
+    struct ggml_init_params params = {
+        /*.mem_size   =*/ pstate.sched_decode.meta.size(),
+        /*.mem_buffer =*/ pstate.sched_decode.meta.data(),
+        /*.no_alloc   =*/ true,
+    };
+
+    struct ggml_context * ctx0 = ggml_init(params);
+    ggml_cgraph * gf = ggml_new_graph_custom(ctx0, PARAKEET_MAX_NODES, false);
+
+    struct ggml_tensor * pred = predict ? parakeet_build_prediction(ctx0, gf, pctx, pstate) : pstate.pred_out;
+
+    struct ggml_tensor * enc = ggml_view_2d(ctx0, pstate.enc_proj, pstate.enc_proj->ne[0], n_rows,
+            pstate.enc_proj->nb[1], (size_t) t0 * pstate.enc_proj->nb[1]);
     ggml_set_name(enc, "enc");
 
     struct ggml_tensor * joint = ggml_add(ctx0, enc, pred);
@@ -2432,99 +2447,83 @@ static struct ggml_cgraph * parakeet_build_graph_joint(
     return gf;
 }
 
-static bool parakeet_predict(
-        parakeet_context & pctx,
-          parakeet_state & pstate,
-    const parakeet_batch & batch,
-               const int   n_threads,
-     ggml_abort_callback   abort_callback,
-                   void  * abort_callback_data) {
-
-    const int n_tokens   = batch.n_tokens;
-
+static bool parakeet_enc_proj(
+         parakeet_context & pctx,
+           parakeet_state & pstate,
+                const int   n_frames,
+                const int   n_threads) {
     const int64_t t_start_us = ggml_time_us();
 
-    {
-        auto & sched = pstate.sched_decode.sched;
+    auto & sched = pstate.sched_decode.sched;
 
-        const int64_t t_build_start_us = ggml_time_us();
-        ggml_cgraph * gf = parakeet_build_graph_prediction(pctx, pstate, batch, false);
-        pstate.t_predict_build_us += ggml_time_us() - t_build_start_us;
+    const int64_t t_build_start_us = ggml_time_us();
+    ggml_cgraph * gf = parakeet_build_graph_enc_proj(pctx, pstate, n_frames);
+    pstate.t_decode_build_us += ggml_time_us() - t_build_start_us;
 
-        const int64_t t_alloc_start_us = ggml_time_us();
-        if (!ggml_backend_sched_alloc_graph(sched, gf)) {
-            // should never happen as we pre-allocate the memory
-            return false;
-        }
-        pstate.t_predict_alloc_us += ggml_time_us() - t_alloc_start_us;
-
-        // set the inputs
-        {
-            struct ggml_tensor * token_inp = ggml_graph_get_tensor(gf, "token_inp");
-            ggml_backend_tensor_set(token_inp, batch.token, 0, n_tokens * ggml_element_size(token_inp));
-        }
-
-        const int64_t t_compute_start_us = ggml_time_us();
-        if (!ggml_graph_compute_helper(sched, gf, n_threads)) {
-            return false;
-        }
-        pstate.t_predict_compute_us += ggml_time_us() - t_compute_start_us;
+    const int64_t t_alloc_start_us = ggml_time_us();
+    if (!ggml_backend_sched_alloc_graph(sched, gf)) {
+        return false;
     }
+    pstate.t_decode_alloc_us += ggml_time_us() - t_alloc_start_us;
 
-    pstate.t_predict_us += ggml_time_us() - t_start_us;
-    pstate.n_predict++;
+    const int64_t t_compute_start_us = ggml_time_us();
+    if (!ggml_graph_compute_helper(sched, gf, n_threads)) {
+        return false;
+    }
+    pstate.t_decode_compute_us += ggml_time_us() - t_compute_start_us;
 
-    return !(abort_callback && abort_callback(abort_callback_data));
+    pstate.t_decode_us += ggml_time_us() - t_start_us;
+    pstate.n_decode++;
+
+    return true;
 }
 
+// Runs one decode step and copies the logits of all n_rows frames to pstate.logits, row after row.
 static bool parakeet_joint(
          parakeet_context & pctx,
            parakeet_state & pstate,
-     const parakeet_batch & batch,
+                const int   t0,
+                const int   n_rows,
+     const parakeet_token * token,
                 const int   n_threads,
       ggml_abort_callback   abort_callback,
                      void * abort_callback_data) {
     const int64_t t_start_us = ggml_time_us();
 
-    const auto & model   = pctx.model;
-    const auto & hparams = model.hparams;
-    const int n_tokens   = batch.n_tokens;
+    const auto & hparams = pctx.model.hparams;
+    auto & sched = pstate.sched_decode.sched;
 
-    auto & logits_out = pstate.logits;
+    const int64_t t_build_start_us = ggml_time_us();
+    ggml_cgraph * gf = parakeet_build_graph_joint(pctx, pstate, t0, n_rows, token != nullptr);
+    pstate.t_decode_build_us += ggml_time_us() - t_build_start_us;
 
-    struct ggml_tensor * logits;
-
-    {
-        auto & sched = pstate.sched_decode.sched;
-
-        ggml_cgraph * gf = parakeet_build_graph_joint(pctx, pstate, batch, false);
-
-        if (!ggml_backend_sched_alloc_graph(sched, gf)) {
-            // should never happen as we pre-allocate the memory
-            return false;
-        }
-
-        logits = ggml_graph_node(gf, -1);
-
-        if (!ggml_graph_compute_helper(sched, gf, n_threads)) {
-            return false;
-        }
-
+    const int64_t t_alloc_start_us = ggml_time_us();
+    if (!ggml_backend_sched_alloc_graph(sched, gf)) {
+        // should never happen as we pre-allocate the memory
+        return false;
     }
+    pstate.t_decode_alloc_us += ggml_time_us() - t_alloc_start_us;
+
+    if (token) {
+        ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "token_inp"), token, 0, sizeof(parakeet_token));
+        pstate.n_predict++;
+    }
+
+    struct ggml_tensor * logits = ggml_graph_node(gf, -1);
+
+    const int64_t t_compute_start_us = ggml_time_us();
+    if (!ggml_graph_compute_helper(sched, gf, n_threads)) {
+        return false;
+    }
+    pstate.t_decode_compute_us += ggml_time_us() - t_compute_start_us;
 
     const int n_logits = hparams.n_vocab + hparams.n_tdt_durations + 1; // one for the blank token
-    logits_out.resize(n_tokens * n_logits);
-    for (int i = 0; i < n_tokens; i++) {
-        if (batch.logits[i] == 0) {
-            continue;
-        }
-        ggml_backend_tensor_get(logits, logits_out.data() + (n_logits*i), sizeof(float)*(n_logits*i), sizeof(float)*n_logits);
-    }
+    pstate.logits.resize((size_t) n_rows * n_logits);
+    ggml_backend_tensor_get(logits, pstate.logits.data(), 0, sizeof(float) * n_rows * n_logits);
 
-    if (batch.n_tokens == 1) {
-        pstate.t_decode_us += ggml_time_us() - t_start_us;
-        pstate.n_decode++;
-    }
+    pstate.t_decode_us += ggml_time_us() - t_start_us;
+    pstate.n_decode++;
+    pstate.n_decode_frames += n_rows;
 
     return !(abort_callback && abort_callback(abort_callback_data));
 }
@@ -2583,7 +2582,7 @@ static void refine_timestamps_tdt(parakeet_vocab & vocab, std::vector<parakeet_t
 
 static parakeet_token_data create_token_data(
             parakeet_context & pctx,
-              parakeet_state & pstate,
+                const float  * logits,
                parakeet_token   token_id,
                           int   duration_idx,
                           int   duration_value,
@@ -2593,12 +2592,12 @@ static parakeet_token_data create_token_data(
 
     float max_logit = token_logit;
     for (int i = 0; i < n_vocab_logits; ++i) {
-        max_logit = std::max(max_logit, pstate.logits[i]);
+        max_logit = std::max(max_logit, logits[i]);
     }
 
     float token_sum = 0.0f;
     for (int i = 0; i < n_vocab_logits; ++i) {
-        token_sum += expf(pstate.logits[i] - max_logit);
+        token_sum += expf(logits[i] - max_logit);
     }
 
     const float log_z = max_logit + logf(token_sum);
@@ -2620,7 +2619,6 @@ static parakeet_token_data create_token_data(
 static bool parakeet_decode(
               parakeet_context & pctx,
                 parakeet_state & pstate,
-                parakeet_batch & batch,
                      const int   n_threads,
     const parakeet_full_params * params = nullptr) {
     const auto & hparams       = pctx.model.hparams;
@@ -2630,6 +2628,7 @@ static bool parakeet_decode(
     const int  n_frames                 = pstate.n_frames;
     const int  blank_id                 = pctx.vocab.token_blank;
     const int  n_vocab_logits           = blank_id + 1;
+    const int  n_logits                 = hparams.n_vocab + n_tdt_durations + 1;
     const int  max_tokens_per_timestep = hparams.n_max_tokens;
 
     // time index into the encoder frame (current time frame)
@@ -2637,129 +2636,112 @@ static bool parakeet_decode(
     // number of symbols emitted for the current time frame
     int tokens_emitted = 0;
 
-    // Start with the blank token (8192)
+    // The prediction network starts from the blank token; each emitted token is fed to it at the
+    // start of the next decode step.
     parakeet_token last_token = blank_id;
+    bool predict = true;
 
     PARAKEET_LOG_DEBUG("parakeet_decode: starting decode with n_frames=%d\n", n_frames);
 
-    batch.n_tokens  = 1;
-    batch.token[0]  = last_token;
-    batch.logits[0] = 1;
-    batch.i_time[0] = 0;
+    const int span = parakeet_decode_span(pctx.model);
 
-    // run the prediction network for the initial blank token. This will
-    // initialize the LSTM state and produce an initial hidden state that can
-    // be used in the joint network below.
-    if (!parakeet_predict(pctx, pstate, batch, n_threads,
-            params ? params->abort_callback           : nullptr,
-            params ? params->abort_callback_user_data : nullptr)) {
+    if (n_frames > 0 && !parakeet_enc_proj(pctx, pstate, n_frames, n_threads)) {
         return false;
     }
 
-    // process all time frames of the encoder output
     while (t < n_frames) {
-        batch.n_tokens  = 1;
-        batch.i_time[0] = t;
-        batch.logits[0] = 1;
+        const int t0     = t;
+        const int n_rows = std::min(span, n_frames - t0);
 
-        // Use the current encoder frame (t) and the output of the prediction to
-        // generate probabilities for the next token and duration. batch.i_time
-        // is used in to select the correct frame from the encoder output.
-        // The joint network outputs logits for all the tokens in the vocabulary
-        // plus the blank token, and also n_duration logits for the duration
-        // tokens which contain information about how many frames to skip/advance forward.
-        if (!parakeet_joint(pctx, pstate, batch, n_threads,
+        // Joint network over frames [t0, t0 + n_rows). Each row holds the logits for all the tokens
+        // in the vocabulary plus the blank token, and n_duration logits for the duration tokens which
+        // tell how many frames to skip/advance forward.
+        if (!parakeet_joint(pctx, pstate, t0, n_rows, predict ? &last_token : nullptr, n_threads,
                 params ? params->abort_callback           : nullptr,
                 params ? params->abort_callback_user_data : nullptr)) {
             return false;
         }
+        predict = false;
 
         const int64_t t_start_sample_us = ggml_time_us();
 
-        // find the best token (greedy).
-        // TODO: implement beam search?
-        int best_token = 0;
-        float max_logit = -1e10f;
-        for (int i = 0; i < n_vocab_logits; ++i) {
-            if (pstate.logits[i] > max_logit) {
-                max_logit = pstate.logits[i];
-                best_token = i;
-            }
-        }
+        // walk the frames of this step; the predictor output is valid up to the first emitted token.
+        while (t < t0 + n_rows) {
+            const float * logits = pstate.logits.data() + (size_t) (t - t0) * n_logits;
 
-        // find the max index of the duration logits, and look up that index
-        // value in the tdt_durations array to get the actual duration value.
-        int best_duration_idx = 0;
-        int duration = 0;
-        if (n_tdt_durations == 0) {
-            // plain transducer: blank advances one frame, a token stays on this one
-            duration = best_token == blank_id ? 1 : 0;
-        } else {
-            float best_duration_logit = pstate.logits[n_vocab_logits];
-            for (int i = 1; i < n_tdt_durations; ++i) {
-                if (pstate.logits[n_vocab_logits + i] > best_duration_logit) {
-                    best_duration_logit = pstate.logits[n_vocab_logits + i];
-                    best_duration_idx = i;
+            // find the best token (greedy).
+            // TODO: implement beam search?
+            int best_token = 0;
+            float max_logit = -1e10f;
+            for (int i = 0; i < n_vocab_logits; ++i) {
+                if (logits[i] > max_logit) {
+                    max_logit = logits[i];
+                    best_token = i;
                 }
             }
-            // look up that max duration index value in the tdt_durations array to
-            // get the actual duration value.
-            duration = tdt_durations[best_duration_idx];
-        }
 
-        if (best_token == blank_id) {
-            if (duration == 0) {
-                duration = 1;
+            // find the max index of the duration logits, and look up that index
+            // value in the tdt_durations array to get the actual duration value.
+            int best_duration_idx = 0;
+            int duration = 0;
+            if (n_tdt_durations == 0) {
+                // plain transducer: blank advances one frame, a token stays on this one
+                duration = best_token == blank_id ? 1 : 0;
+            } else {
+                float best_duration_logit = logits[n_vocab_logits];
+                for (int i = 1; i < n_tdt_durations; ++i) {
+                    if (logits[n_vocab_logits + i] > best_duration_logit) {
+                        best_duration_logit = logits[n_vocab_logits + i];
+                        best_duration_idx = i;
+                    }
+                }
+                duration = tdt_durations[best_duration_idx];
             }
-            // skip forward by duration time frames.
-            t += duration;
-            // reset symbols emitted counter
-            tokens_emitted = 0;
-            // continue without predicting.
-            continue;
+
+            if (best_token == blank_id) {
+                if (duration == 0) {
+                    duration = 1;
+                }
+                // skip forward by duration time frames without predicting.
+                t += duration;
+                tokens_emitted = 0;
+                continue;
+            }
+
+            // Emit non-blank token at current frame t.
+            pstate.decoded_tokens.push_back(best_token);
+            pstate.n_sample++;
+
+            parakeet_token_data token_data = create_token_data(
+                pctx, logits, best_token, best_duration_idx,
+                n_tdt_durations == 0 ? 1 : duration,   // a plain transducer gives no duration; span one frame
+                t, max_logit, n_vocab_logits);
+
+            pstate.decoded_token_data.push_back(token_data);
+
+            // Call token callback if registered (for real-time streaming)
+            if (params && params->new_token_callback) {
+                params->new_token_callback(&pctx, &pstate, &token_data, params->new_token_callback_user_data);
+            }
+
+            last_token = best_token;
+            predict    = true;
+
+            if (duration > 0) {
+                t += duration;
+                tokens_emitted = 0;
+            } else {
+                // if duration is zero we stay on the current time frame.
+                tokens_emitted++;
+                if (tokens_emitted >= max_tokens_per_timestep) {
+                    t += 1; // forced blank/time advance behavior
+                    tokens_emitted = 0;
+                }
+            }
+            break;
         }
 
-        // Emit non-blank token at current frame t.
-        pstate.decoded_tokens.push_back(best_token);
         pstate.t_sample_us += ggml_time_us() - t_start_sample_us;
-        pstate.n_sample++;
-
-        parakeet_token_data token_data = create_token_data(
-            pctx, pstate, best_token, best_duration_idx,
-            n_tdt_durations == 0 ? 1 : duration,   // a plain transducer gives no duration; span one frame
-            t, max_logit, n_vocab_logits);
-
-        pstate.decoded_token_data.push_back(token_data);
-
-        // Call token callback if registered (for real-time streaming)
-        if (params && params->new_token_callback) {
-            params->new_token_callback(&pctx, &pstate, &token_data, params->new_token_callback_user_data);
-        }
-
-        last_token = best_token;
-
-        // advance predictor for the non-blank token.
-        batch.token[0] = last_token;
-        if (!parakeet_predict(pctx, pstate, batch, n_threads,
-                params ? params->abort_callback           : nullptr,
-                params ? params->abort_callback_user_data : nullptr)) {
-            return false;
-        }
-
-        // if duration greater than 0, continue looping over the encoder frames
-        // and skip to the updated time frame (t).
-        if (duration > 0) {
-            t += duration;
-            tokens_emitted = 0;
-            continue;
-        }
-
-        // if duration is zero we stay on the current time frame.
-        tokens_emitted++;
-        if (tokens_emitted >= max_tokens_per_timestep) {
-            t += 1; // forced blank/time advance behavior
-            tokens_emitted = 0;
-        }
     }
 
     return true;
@@ -3092,7 +3074,7 @@ struct parakeet_state * parakeet_init_state(parakeet_context * ctx) {
         const int subsampl_factor  = ctx->model.hparams.subsampling_factor;
         const int n_frames_max     = (batch_size + subsampl_factor - 1) / subsampl_factor;
 
-        if (!parakeet_enc_state_init(*state, state->backends[0], n_audio_state, n_frames_max)) {
+        if (!parakeet_enc_state_init(*state, state->backends[0], n_audio_state, ctx->model.joint.enc_w->ne[1], n_frames_max)) {
             PARAKEET_LOG_ERROR("%s: parakeet_enc_state_init() failed\n", __func__);
             parakeet_free_state(state);
             return nullptr;
@@ -3148,12 +3130,8 @@ struct parakeet_state * parakeet_init_state(parakeet_context * ctx) {
     {
         bool ok = parakeet_sched_graph_init(state->sched_decode, state->backends,
                 [&]() {
-                    const auto & hparams = ctx->model.hparams;
-                    const int n_tokens = hparams.n_audio_ctx; // Use audio ctx for Parakeet
-
-                    parakeet_batch_prep_legacy(state->batch, nullptr, n_tokens, 0, 0);
-
-                    return parakeet_build_graph_prediction(*ctx, *state, state->batch, true);
+                    const int n_rows = std::min<int>(parakeet_decode_span(ctx->model), state->enc_out->ne[1]);
+                    return parakeet_build_graph_joint(*ctx, *state, 0, n_rows, true);
                 });
 
         if (!ok) {
@@ -3584,17 +3562,16 @@ void parakeet_print_timings(struct parakeet_context * ctx) {
         const int32_t n_sample  = std::max(1, ctx->state->n_sample);
         const int32_t n_encode  = std::max(1, ctx->state->n_encode);
         const int32_t n_decode  = std::max(1, ctx->state->n_decode);
-        const int32_t n_predict = std::max(1, ctx->state->n_predict);
 
         PARAKEET_LOG_INFO("%s:     fallbacks = %3d p / %3d h\n", __func__, ctx->state->n_fail_p, ctx->state->n_fail_h);
         PARAKEET_LOG_INFO("%s:      mel time = %8.2f ms\n", __func__, ctx->state->t_mel_us / 1000.0f);
         PARAKEET_LOG_INFO("%s:   sample time = %8.2f ms / %5d runs ( %8.2f ms per run)\n", __func__, 1e-3f * ctx->state->t_sample_us, n_sample, 1e-3f * ctx->state->t_sample_us / n_sample);
         PARAKEET_LOG_INFO("%s:   encode time = %8.2f ms / %5d runs ( %8.2f ms per run)\n", __func__, 1e-3f * ctx->state->t_encode_us, n_encode, 1e-3f * ctx->state->t_encode_us / n_encode);
         PARAKEET_LOG_INFO("%s:   decode time = %8.2f ms / %5d runs ( %8.2f ms per run)\n", __func__, 1e-3f * ctx->state->t_decode_us, n_decode, 1e-3f * ctx->state->t_decode_us / n_decode);
-        PARAKEET_LOG_INFO("%s:  predict time = %8.2f ms / %5d runs ( %8.2f ms per run)\n", __func__, 1e-3f * ctx->state->t_predict_us, n_predict, 1e-3f * ctx->state->t_predict_us / n_predict);
-        PARAKEET_LOG_INFO("%s:    - build     = %8.2f ms / %5d runs ( %8.2f ms per run)\n", __func__, 1e-3f * ctx->state->t_predict_build_us, n_predict, 1e-3f * ctx->state->t_predict_build_us / n_predict);
-        PARAKEET_LOG_INFO("%s:    - alloc     = %8.2f ms / %5d runs ( %8.2f ms per run)\n", __func__, 1e-3f * ctx->state->t_predict_alloc_us, n_predict, 1e-3f * ctx->state->t_predict_alloc_us / n_predict);
-        PARAKEET_LOG_INFO("%s:    - compute   = %8.2f ms / %5d runs ( %8.2f ms per run)\n", __func__, 1e-3f * ctx->state->t_predict_compute_us, n_predict, 1e-3f * ctx->state->t_predict_compute_us / n_predict);
+        PARAKEET_LOG_INFO("%s:    - build     = %8.2f ms / %5d runs ( %8.2f ms per run)\n", __func__, 1e-3f * ctx->state->t_decode_build_us, n_decode, 1e-3f * ctx->state->t_decode_build_us / n_decode);
+        PARAKEET_LOG_INFO("%s:    - alloc     = %8.2f ms / %5d runs ( %8.2f ms per run)\n", __func__, 1e-3f * ctx->state->t_decode_alloc_us, n_decode, 1e-3f * ctx->state->t_decode_alloc_us / n_decode);
+        PARAKEET_LOG_INFO("%s:    - compute   = %8.2f ms / %5d runs ( %8.2f ms per run)\n", __func__, 1e-3f * ctx->state->t_decode_compute_us, n_decode, 1e-3f * ctx->state->t_decode_compute_us / n_decode);
+        PARAKEET_LOG_INFO("%s:    - frames    = %5d, predictor steps = %5d\n", __func__, ctx->state->n_decode_frames, ctx->state->n_predict);
 
     }
     PARAKEET_LOG_INFO("%s:    total time = %8.2f ms\n", __func__, (t_end_us - ctx->t_start_us)/1000.0f);
@@ -3607,14 +3584,14 @@ void parakeet_reset_timings(struct parakeet_context * ctx) {
         ctx->state->t_sample_us = 0;
         ctx->state->t_encode_us = 0;
         ctx->state->t_decode_us = 0;
-        ctx->state->t_predict_us = 0;
-        ctx->state->t_predict_build_us = 0;
-        ctx->state->t_predict_alloc_us = 0;
-        ctx->state->t_predict_compute_us = 0;
+        ctx->state->t_decode_build_us = 0;
+        ctx->state->t_decode_alloc_us = 0;
+        ctx->state->t_decode_compute_us = 0;
 
         ctx->state->n_sample = 0;
         ctx->state->n_encode = 0;
         ctx->state->n_decode = 0;
+        ctx->state->n_decode_frames = 0;
         ctx->state->n_predict = 0;
     }
 }
@@ -3766,19 +3743,22 @@ int parakeet_full_with_state(
     const int    n_mel_total = state->mel.n_len;
     const int    n_frames    = (n_mel_total + f - 1) / f;
 
-    // Attention is quadratic in the frames it sees, so a long recording is encoded in overlapping
-    // windows and decoded once. The window is 4 * W, W being the runtime's attention span, and keeps
-    // the model inside the context range it handles: full attention over a 78 s recording left 3
-    // words where these windows kept 24. At a fixed window the cost per frame kept is proportional to
-    // 1 / core, so the context overlap should be as small as the transcript allows. Measured on long
-    // recordings at W, W/2, W/4 and W/8: W/4 and below lose whole utterances, W/2 does not, so the
-    // context is W/2 and the core 3 * W. The window also has to fit the model's audio context.
+    // A recording within the model's declared audio context is encoded in one pass, which is what
+    // the model was built for: on FLEURS te_in, 20-30 s utterances in one pass score 3.8% CER.
+    // Beyond it, attention is quadratic in the frames it sees, so the recording is encoded in
+    // overlapping windows and decoded once. The window is 4 * W, W being the runtime's attention
+    // span. At a fixed window the cost per frame kept is proportional to 1 / core, so the overlap
+    // should be as small as the transcript allows: measured at W, W/2, W/4 and W/8, W/4 and below
+    // lose whole utterances and W/2 does not, so the context is W/2 and the core 3 * W. Windows are
+    // not used below the audio context: they cost more than one pass there (the linear half of the
+    // encoder runs twice on the overlap), and every window edge is one more place a transducer that
+    // misses its first word stays blank for the rest of the window.
     const int n_ctx_w = std::min(PARAKEET_LOCAL_ATTN_WINDOW, hparams.n_audio_ctx / (4 * f));
     const int win     = 4 * n_ctx_w;
     const int n_ctx   = n_ctx_w / 2;
     const int core    = win - 2 * n_ctx;
 
-    if (n_frames <= win) {
+    if (n_mel_total <= hparams.n_audio_ctx) {
         if (params.progress_callback) {
             params.progress_callback(ctx, state, 0, params.progress_callback_user_data);
         }
@@ -3834,7 +3814,7 @@ int parakeet_full_with_state(
 
     const size_t tokens_before = state->decoded_tokens.size();
 
-    if (!parakeet_decode(*ctx, *state, state->batch, params.n_threads, &params)) {
+    if (!parakeet_decode(*ctx, *state, params.n_threads, &params)) {
         PARAKEET_LOG_ERROR("%s: failed to decode\n", __func__);
         return -7;
     }
@@ -3899,7 +3879,7 @@ int parakeet_chunk(
 
     const size_t tokens_before = state->decoded_tokens.size();
 
-    if (!parakeet_decode(*ctx, *state, state->batch, params.n_threads, &params)) {
+    if (!parakeet_decode(*ctx, *state, params.n_threads, &params)) {
         PARAKEET_LOG_ERROR("%s: failed to decode\n", __func__);
         return -7;
     }
