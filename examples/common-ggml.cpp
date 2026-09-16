@@ -73,6 +73,9 @@ bool ggml_common_fit_levels(
     const int    ROUNDS = getenv("NEURON_FIT_ROUNDS") ? atoi(getenv("NEURON_FIT_ROUNDS")) : 12;
     const float  ALPHA  = getenv("NEURON_FIT_ALPHA")  ? (float) atof(getenv("NEURON_FIT_ALPHA"))  : 2.5f;
     const float  FLOOR  = getenv("NEURON_FIT_FLOOR")  ? (float) atof(getenv("NEURON_FIT_FLOOR"))  : 1.0f / 16.0f;
+    if (getenv("NEURON_FIT_DISABLE")) {
+        return false;                        // keep the shipped table, for A/B against the fit
+    }
 
     const std::streampos start = finp.tellg();
 
