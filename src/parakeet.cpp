@@ -1707,6 +1707,9 @@ static struct ggml_cgraph * parakeet_build_graph_encode(parakeet_context & pctx,
     struct ggml_tensor * pos_emb = ggml_reshape_2d(ctx0, ggml_cont(ctx0, ggml_concat(ctx0, sin_t, cos_t, 0)), n_state, window_size);
     ggml_set_name(pos_emb, "pos_emb");
 
+    // full attention pads and rolls each layer's position scores; the position projection has no bias, so one zero position in front gives that layout once here
+    struct ggml_tensor * pos_emb_shift = local_attn ? pos_emb : ggml_pad_ext(ctx0, pos_emb, 0, 0, 1, 0, 0, 0, 0, 0);
+
     for (int il = 0; il < n_layer; ++il) {
         const auto & layer = model.layers[il];
 
@@ -1765,8 +1768,8 @@ static struct ggml_cgraph * parakeet_build_graph_encode(parakeet_context & pctx,
             K_cur = ggml_reshape_3d(ctx0, K_cur, d_head, n_head, n_time);
             V_cur = ggml_reshape_3d(ctx0, V_cur, d_head, n_head, n_time);
 
-            struct ggml_tensor * pos = ggml_mul_mat(ctx0, layer.attn_pos_w, pos_emb);
-            pos = ggml_reshape_3d(ctx0, pos, d_head, n_head, window_size);
+            struct ggml_tensor * pos = ggml_mul_mat(ctx0, layer.attn_pos_w, pos_emb_shift);
+            pos = ggml_reshape_3d(ctx0, pos, d_head, n_head, pos_emb_shift->ne[1]);
             pos = ggml_cont(ctx0, ggml_permute(ctx0, pos, 0, 2, 1, 3));
 
             if (local_attn) {
@@ -1913,17 +1916,14 @@ static struct ggml_cgraph * parakeet_build_graph_encode(parakeet_context & pctx,
 
                 struct ggml_tensor * rel_pos_scores = ggml_mul_mat(ctx0, pos, Q_v);
                 ggml_format_name(rel_pos_scores, "enc_%d_attn_rel_pos", il);
-
                 // Relative position shifting is performed in the following block.
                 // Some more details on the operations performed below can be found here:
                 // https://github.com/danbev/learning-ai/blob/main/notes/whisper/parakeet.md#relative-position-shift
                 {
-                    const auto pos_window = rel_pos_scores->ne[0];
+                    // already padded and rolled: pos_emb_shift carries the zero position in front
+                    const auto pos_window = rel_pos_scores->ne[0] - 1;
                     const auto n_frame    = rel_pos_scores->ne[1];
                     const auto n_head_cur = rel_pos_scores->ne[2];
-
-                    rel_pos_scores = ggml_pad(ctx0, rel_pos_scores, 1, 0, 0, 0);
-                    rel_pos_scores = ggml_roll(ctx0, rel_pos_scores, 1, 0, 0, 0);
 
                     rel_pos_scores = ggml_reshape_3d(ctx0, rel_pos_scores, n_frame, pos_window + 1, n_head_cur);
                     ggml_format_name(rel_pos_scores, "enc_%d_attn_rel_pos_reshaped", il);
@@ -1946,17 +1946,14 @@ static struct ggml_cgraph * parakeet_build_graph_encode(parakeet_context & pctx,
                                                   rel_pos_scores->nb[1],
                                                   rel_pos_scores->nb[2],
                                                   0);
-                    rel_pos_scores = ggml_cont(ctx0, rel_pos_scores);
                     ggml_format_name(rel_pos_scores, "enc_%d_attn_rel_pos_shifted_view", il);
                 }
 
                 struct ggml_tensor * attn_scores = ggml_add(ctx0, content_scores, rel_pos_scores);
                 ggml_format_name(attn_scores, "enc_%d_attn_scores", il);
-                attn_scores = ggml_scale(ctx0, attn_scores, 1.0f / std::sqrt(d_head));
-                attn_scores = ggml_add(ctx0, attn_scores, attn_mask);
-                ggml_format_name(attn_scores, "enc_%d_attn_scores_scaled", il);
 
-                struct ggml_tensor * probs = ggml_soft_max(ctx0, attn_scores);
+                // scale, mask and softmax in one kernel, as the local branch does
+                struct ggml_tensor * probs = ggml_soft_max_ext(ctx0, attn_scores, attn_mask, 1.0f / std::sqrt(d_head), 0.0f);
                 ggml_format_name(probs, "enc_%d_attn_probs", il);
 
                 V_cur = ggml_cont(ctx0, ggml_permute(ctx0, V_cur, 1, 2, 0, 3));
