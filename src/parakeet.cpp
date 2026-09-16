@@ -2131,7 +2131,10 @@ static bool parakeet_encode_internal(
         const int n_k = attn_mask->ne[0];
 
         const int32_t subsampl_factor = pctx.model.hparams.subsampling_factor;
-        const int n_tokens_real = (pstate.mel.n_len_org + subsampl_factor - 1) / subsampl_factor;
+        // real mel frames in this window: a window starting at mel_offset may run past the end
+        const int n_ctx_mel     = pstate.n_audio_ctx > 0 ? pstate.n_audio_ctx : pctx.model.hparams.n_audio_ctx;
+        const int n_mel_real    = std::max(0, std::min(pstate.mel.n_len_org - mel_offset, n_ctx_mel));
+        const int n_tokens_real = (n_mel_real + subsampl_factor - 1) / subsampl_factor;
 
         std::vector<float> mask_data(n_q * n_k);
         const float mask_value = -1e30f;
@@ -2211,6 +2214,20 @@ static bool parakeet_encode_internal(
     return !(abort_callback && abort_callback(abort_callback_data));
 }
 
+// grow the encoder output to hold n_frames frames; never shrinks
+static bool parakeet_ensure_enc_out(
+        parakeet_context & pctx,
+          parakeet_state & pstate,
+                    int    n_frames) {
+    if (pstate.enc_out && n_frames <= pstate.enc_out->ne[1]) {
+        return true;
+    }
+    ggml_backend_buffer_free(pstate.enc_out_buffer);
+    pstate.enc_out_buffer = nullptr;
+    pstate.enc_out = nullptr;
+    return parakeet_enc_state_init(pstate, pstate.backends[0], pctx.model.hparams.n_audio_state, n_frames);
+}
+
 static bool parakeet_ensure_encode_sched(
         parakeet_context & pctx,
           parakeet_state & pstate,
@@ -2226,16 +2243,10 @@ static bool parakeet_ensure_encode_sched(
 
     const int subsampl_factor = pctx.model.hparams.subsampling_factor;
     const int n_frames_max = (n_audio_ctx + subsampl_factor - 1) / subsampl_factor;
-    if (n_frames_max > pstate.enc_out->ne[1]) {
-        ggml_backend_buffer_free(pstate.enc_out_buffer);
-        pstate.enc_out_buffer = nullptr;
-        pstate.enc_out = nullptr;
-
-        if (!parakeet_enc_state_init(pstate, pstate.backends[0], pctx.model.hparams.n_audio_state, n_frames_max)) {
-            pstate.sched_encode_n_audio_ctx = 0;
-            pstate.n_audio_ctx = prev_n_audio_ctx;
-            return false;
-        }
+    if (!parakeet_ensure_enc_out(pctx, pstate, n_frames_max)) {
+        pstate.sched_encode_n_audio_ctx = 0;
+        pstate.n_audio_ctx = prev_n_audio_ctx;
+        return false;
     }
 
     const bool ok = parakeet_sched_graph_init(pstate.sched_encode, pstate.backends,
@@ -3682,6 +3693,48 @@ static void parakeet_reset_state(struct parakeet_state * state) {
 }
 
 // Encode and decode the mel spectrogram already in state, without recomputing it.
+// The tokens decoded since tokens_before, as one segment ending at t1 (mel frames).
+static void parakeet_emit_segment(
+        struct parakeet_context * ctx,
+          struct parakeet_state * state,
+    const parakeet_full_params  & params,
+                         size_t   tokens_before,
+                            int   t1) {
+    const size_t tokens_after = state->decoded_tokens.size();
+    if (tokens_after == tokens_before) {
+        return;
+    }
+
+    std::string text;
+    std::vector<parakeet_token_data> result_tokens;
+
+    for (size_t i = tokens_before; i < tokens_after; i++) {
+        const char * token_str = parakeet_token_to_str(ctx, state->decoded_tokens[i]);
+        if (token_str) {
+            const bool is_first_piece = (tokens_before == 0) && text.empty();
+            text += sentencepiece_piece_to_text(token_str, is_first_piece);
+        }
+        result_tokens.push_back(state->decoded_token_data[i]);
+    }
+
+    refine_timestamps_tdt(ctx->vocab, result_tokens);
+
+    if (text.empty()) {
+        return;
+    }
+
+    parakeet_segment segment;
+    segment.t0     = 0;
+    segment.t1     = t1;
+    segment.text   = text;
+    segment.tokens = result_tokens;
+    state->result_all.push_back(std::move(segment));
+
+    if (params.new_segment_callback) {
+        params.new_segment_callback(ctx, state, 1, params.new_segment_callback_user_data);
+    }
+}
+
 static int parakeet_chunk_with_state(
       struct parakeet_context   * ctx,
         struct parakeet_state   * state,
@@ -3708,18 +3761,31 @@ int parakeet_full_with_state(
         }
     }
 
-    const int n_mel_total = state->mel.n_len;
-    const int n_audio_ctx = ctx->model.hparams.n_audio_ctx;
+    const auto & hparams     = ctx->model.hparams;
+    const int    f           = hparams.subsampling_factor;
+    const int    n_mel_total = state->mel.n_len;
+    const int    n_frames    = (n_mel_total + f - 1) / f;
 
-    if (n_mel_total <= n_audio_ctx) {
+    // Attention is quadratic in the frames it sees, so a long recording is encoded in overlapping
+    // windows and decoded once. The window is 4 * W, W being the runtime's attention span, and keeps
+    // the model inside the context range it handles: full attention over a 78 s recording left 3
+    // words where these windows kept 24. At a fixed window the cost per frame kept is proportional to
+    // 1 / core, so the context overlap should be as small as the transcript allows. Measured on long
+    // recordings at W, W/2, W/4 and W/8: W/4 and below lose whole utterances, W/2 does not, so the
+    // context is W/2 and the core 3 * W. The window also has to fit the model's audio context.
+    const int n_ctx_w = std::min(PARAKEET_LOCAL_ATTN_WINDOW, hparams.n_audio_ctx / (4 * f));
+    const int win     = 4 * n_ctx_w;
+    const int n_ctx   = n_ctx_w / 2;
+    const int core    = win - 2 * n_ctx;
+
+    if (n_frames <= win) {
         if (params.progress_callback) {
             params.progress_callback(ctx, state, 0, params.progress_callback_user_data);
         }
         return parakeet_chunk_with_state(ctx, state, params);
     }
 
-    PARAKEET_LOG_DEBUG("%s: audio too long (%d mel > n_audio_ctx=%d), using dynamic encoder graph\n",
-                       __func__, n_mel_total, n_audio_ctx);
+    PARAKEET_LOG_DEBUG("%s: %d frames, encoding in windows of %d keeping %d\n", __func__, n_frames, win, core);
 
     if (params.encoder_begin_callback) {
         if (!params.encoder_begin_callback(ctx, state, params.encoder_begin_callback_user_data)) {
@@ -3732,23 +3798,39 @@ int parakeet_full_with_state(
         params.progress_callback(ctx, state, 0, params.progress_callback_user_data);
     }
 
-    if (!parakeet_ensure_encode_sched(*ctx, *state, n_mel_total)) {
-        PARAKEET_LOG_ERROR("%s: failed to allocate dynamic encoder graph for %d mel frames\n",
-                __func__, n_mel_total);
+    // the output holds the whole recording; each window's graph writes its own frames at offset 0
+    if (!parakeet_ensure_enc_out(*ctx, *state, n_frames) ||
+        !parakeet_ensure_encode_sched(*ctx, *state, win * f)) {
+        PARAKEET_LOG_ERROR("%s: failed to allocate the encoder for windows of %d frames\n", __func__, win);
         return -6;
     }
 
-    state->n_audio_ctx = n_mel_total;
+    const size_t row = state->enc_out->nb[1];
+    std::vector<float> frames((size_t) n_frames * hparams.n_audio_state);
 
-    if (!parakeet_encode_internal(*ctx, *state, 0, params.n_threads,
-                                  params.abort_callback, params.abort_callback_user_data)) {
-        PARAKEET_LOG_ERROR("%s: failed to encode\n", __func__);
-        return -6;
+    for (int c = 0; c < n_frames; c += core) {
+        const int start = std::max(0, c - n_ctx);
+        const int keep  = std::min(core, n_frames - c);
+
+        state->n_audio_ctx = win * f;
+        if (!parakeet_encode_internal(*ctx, *state, start * f, params.n_threads,
+                                      params.abort_callback, params.abort_callback_user_data)) {
+            PARAKEET_LOG_ERROR("%s: failed to encode the window at frame %d\n", __func__, c);
+            return -6;
+        }
+
+        ggml_backend_tensor_get(state->enc_out, (char *) frames.data() + (size_t) c * row,
+                                (size_t) (c - start) * row, (size_t) keep * row);
+
+        if (params.progress_callback) {
+            params.progress_callback(ctx, state, (int) (100LL * (c + keep) / n_frames),
+                                     params.progress_callback_user_data);
+        }
     }
 
-    if (params.progress_callback) {
-        params.progress_callback(ctx, state, 100, params.progress_callback_user_data);
-    }
+    // one continuous sequence for the transducer
+    ggml_backend_tensor_set(state->enc_out, frames.data(), 0, (size_t) n_frames * row);
+    state->n_frames = n_frames;
 
     const size_t tokens_before = state->decoded_tokens.size();
 
@@ -3757,38 +3839,7 @@ int parakeet_full_with_state(
         return -7;
     }
 
-    const size_t tokens_after    = state->decoded_tokens.size();
-    const size_t new_token_count = tokens_after - tokens_before;
-
-    if (new_token_count > 0) {
-        std::string text;
-        std::vector<parakeet_token_data> result_tokens;
-
-        for (size_t i = tokens_before; i < tokens_after; i++) {
-            const auto token_id  = state->decoded_tokens[i];
-            const char * tok_str = parakeet_token_to_str(ctx, token_id);
-            if (tok_str) {
-                const bool is_first = (tokens_before == 0) && text.empty();
-                text += sentencepiece_piece_to_text(tok_str, is_first);
-            }
-            result_tokens.push_back(state->decoded_token_data[i]);
-        }
-
-        refine_timestamps_tdt(ctx->vocab, result_tokens);
-
-        if (!text.empty()) {
-            parakeet_segment seg;
-            seg.t0     = 0;
-            seg.t1     = state->n_frames;
-            seg.text   = text;
-            seg.tokens = result_tokens;
-            state->result_all.push_back(std::move(seg));
-
-            if (params.new_segment_callback) {
-                params.new_segment_callback(ctx, state, 1, params.new_segment_callback_user_data);
-            }
-        }
-    }
+    parakeet_emit_segment(ctx, state, params, tokens_before, n_mel_total);
 
     return 0;
 }
@@ -3853,41 +3904,7 @@ int parakeet_chunk(
         return -7;
     }
 
-    const size_t tokens_after = state->decoded_tokens.size();
-    const size_t new_token_count = tokens_after - tokens_before;
-
-    if (new_token_count > 0) {
-        std::string text;
-        std::vector<parakeet_token_data> result_tokens;
-
-        for (size_t i = tokens_before; i < tokens_after; i++) {
-            const auto token_id = state->decoded_tokens[i];
-            const char * token_str = parakeet_token_to_str(ctx, token_id);
-            if (token_str) {
-                const bool is_first_piece = (tokens_before == 0) && text.empty();
-                text += sentencepiece_piece_to_text(token_str, is_first_piece);
-            }
-
-            // Use the stored token data from parakeet_decode
-            result_tokens.push_back(state->decoded_token_data[i]);
-        }
-
-        refine_timestamps_tdt(ctx->vocab, result_tokens);
-
-        if (!text.empty()) {
-            parakeet_segment segment;
-            segment.t0 = 0; // Caller tracks timing
-            segment.t1 = n_frames;
-            segment.text = text;
-            segment.tokens = result_tokens;
-
-            state->result_all.push_back(std::move(segment));
-
-            if (params.new_segment_callback) {
-                params.new_segment_callback(ctx, state, 1, params.new_segment_callback_user_data);
-            }
-        }
-    }
+    parakeet_emit_segment(ctx, state, params, tokens_before, n_frames);
 
     return 0;
 }
