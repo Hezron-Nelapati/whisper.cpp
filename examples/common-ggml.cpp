@@ -19,10 +19,10 @@ static const std::map<std::string, enum ggml_ftype> GGML_FTYPE_MAP = {
     {"q5_k", GGML_FTYPE_MOSTLY_Q5_K},
     {"q6_k", GGML_FTYPE_MOSTLY_Q6_K},
     {"neuron_v4", GGML_FTYPE_MOSTLY_NEURON_V4},
-    {"neuron_l4", GGML_FTYPE_MOSTLY_NEURON_L4},
-    {"neuron_l5", GGML_FTYPE_MOSTLY_NEURON_L5},
-    {"neuron_l6", GGML_FTYPE_MOSTLY_NEURON_L6},
-    {"neuron_l7", GGML_FTYPE_MOSTLY_NEURON_L7},
+    {"neuron_l4a", GGML_FTYPE_MOSTLY_NEURON_L4A},
+    {"neuron_l5a", GGML_FTYPE_MOSTLY_NEURON_L5A},
+    {"neuron_l6a", GGML_FTYPE_MOSTLY_NEURON_L6A},
+    {"neuron_l7a", GGML_FTYPE_MOSTLY_NEURON_L7A},
 };
 
 void ggml_print_ftypes(FILE * fp) {
@@ -231,10 +231,10 @@ bool ggml_common_quantize_0(
         case GGML_FTYPE_MOSTLY_Q5_K: qtype = GGML_TYPE_Q5_K; break;
         case GGML_FTYPE_MOSTLY_Q6_K: qtype = GGML_TYPE_Q6_K; break;
         case GGML_FTYPE_MOSTLY_NEURON_V4: qtype = GGML_TYPE_NEURON_V4; break;
-        case GGML_FTYPE_MOSTLY_NEURON_L4: qtype = GGML_TYPE_NEURON_L4; break;
-        case GGML_FTYPE_MOSTLY_NEURON_L5: qtype = GGML_TYPE_NEURON_L5; break;
-        case GGML_FTYPE_MOSTLY_NEURON_L6: qtype = GGML_TYPE_NEURON_L6; break;
-        case GGML_FTYPE_MOSTLY_NEURON_L7: qtype = GGML_TYPE_NEURON_L7; break;
+        case GGML_FTYPE_MOSTLY_NEURON_L4A: qtype = GGML_TYPE_NEURON_L4A; break;
+        case GGML_FTYPE_MOSTLY_NEURON_L5A: qtype = GGML_TYPE_NEURON_L5A; break;
+        case GGML_FTYPE_MOSTLY_NEURON_L6A: qtype = GGML_TYPE_NEURON_L6A; break;
+        case GGML_FTYPE_MOSTLY_NEURON_L7A: qtype = GGML_TYPE_NEURON_L7A; break;
         case GGML_FTYPE_UNKNOWN:
         case GGML_FTYPE_ALL_F32:
         case GGML_FTYPE_MOSTLY_F16:
@@ -369,10 +369,10 @@ bool ggml_common_quantize_0(
                 case GGML_TYPE_Q5_K:
                 case GGML_TYPE_Q6_K:
                 case GGML_TYPE_NEURON_V4:
-                case GGML_TYPE_NEURON_L4:
-                case GGML_TYPE_NEURON_L5:
-                case GGML_TYPE_NEURON_L6:
-                case GGML_TYPE_NEURON_L7:
+                case GGML_TYPE_NEURON_L4A:
+                case GGML_TYPE_NEURON_L5A:
+                case GGML_TYPE_NEURON_L6A:
+                case GGML_TYPE_NEURON_L7A:
                     {
                         cur_size = ggml_quantize_chunk((ggml_type) ttype, data_f32.data(), work.data(), 0, nelements/ne[0], ne[0], nullptr);
                     } break;
