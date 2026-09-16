@@ -1682,6 +1682,24 @@ static bool whisper_model_load(struct whisper_model_loader * loader, whisper_con
         WHISPER_LOG_INFO("%s: n_langs       = %d\n", __func__, vocab.num_languages());
     }
 
+    // lattice levels: part of the format, fitted on this model when it was quantized
+    if (ggml_neuron_l_n_levels(wctx.wtype) > 0) {
+        int32_t n_levels = 0;
+        read_safe(loader, n_levels);
+        if (n_levels == 0) {
+            ggml_neuron_l_set_levels(wctx.wtype, nullptr);
+        } else if (n_levels != ggml_neuron_l_n_levels(wctx.wtype)) {
+            WHISPER_LOG_ERROR("%s: %s needs %d levels, the file has %d\n", __func__,
+                    ggml_type_name(wctx.wtype), ggml_neuron_l_n_levels(wctx.wtype), n_levels);
+            return false;
+        } else {
+            std::vector<float> levels(n_levels);
+            loader->read(loader->context, levels.data(), levels.size() * sizeof(float));
+            ggml_neuron_l_set_levels(wctx.wtype, levels.data());
+            WHISPER_LOG_INFO("%s: bound this model's own %d %s levels\n", __func__, n_levels, ggml_type_name(wctx.wtype));
+        }
+    }
+
     const ggml_type wtype = wctx.wtype;
     const ggml_type vtype = wctx.wtype == GGML_TYPE_F32 ? GGML_TYPE_F32 : GGML_TYPE_F16; // conv type
 

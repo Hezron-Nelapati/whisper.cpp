@@ -179,6 +179,17 @@ static bool parakeet_model_quantize(const std::string & fname_inp, const std::st
         }
     }
 
+    // the lattice levels are a property of the model, so fit them here and carry them in the file
+    {
+        std::vector<float> levels;
+        const bool fitted = ggml_common_fit_levels(finp, ftype, to_quant, to_skip, levels);
+        const int32_t n_levels = fitted ? (int32_t) levels.size() : 0;
+        if (ggml_neuron_l_n_levels(ggml_ftype_to_ggml_type(ftype)) > 0) {
+            fout.write((const char *) &n_levels, sizeof(n_levels));
+            fout.write((const char *) levels.data(), n_levels * sizeof(float));
+        }
+    }
+
     if (!ggml_common_quantize_0(finp, fout, ftype, to_quant, to_skip)) {
         fprintf(stderr, "%s: failed to quantize tensors\n", __func__);
         return false;

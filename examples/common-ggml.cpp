@@ -1,7 +1,11 @@
 #include "common-ggml.h"
 
-#include <regex>
+#include <algorithm>
+#include <cmath>
+#include <cstdlib>
+#include <cstring>
 #include <map>
+#include <regex>
 
 static const std::map<std::string, enum ggml_ftype> GGML_FTYPE_MAP = {
     {"q4_0", GGML_FTYPE_MOSTLY_Q4_0},
@@ -18,6 +22,7 @@ static const std::map<std::string, enum ggml_ftype> GGML_FTYPE_MAP = {
     {"neuron_l4", GGML_FTYPE_MOSTLY_NEURON_L4},
     {"neuron_l5", GGML_FTYPE_MOSTLY_NEURON_L5},
     {"neuron_l6", GGML_FTYPE_MOSTLY_NEURON_L6},
+    {"neuron_l7", GGML_FTYPE_MOSTLY_NEURON_L7},
 };
 
 void ggml_print_ftypes(FILE * fp) {
@@ -41,6 +46,165 @@ enum ggml_ftype ggml_parse_ftype(const char * str) {
     }
 
     return ftype;
+}
+
+// Fit the lattice levels on this model's own weights. Lloyd with the real encoder in the loop:
+// encode sampled blocks with the current levels, then move each magnitude to the scale-weighted
+// mean of the values that picked it. The recipe is llama-quantize's: 12 rounds from the uniform
+// grid at |x/g|^-2.5, top level scaled to 1. Leaves finp where it found it.
+bool ggml_common_fit_levels(
+        std::ifstream & finp,
+        const ggml_ftype ftype,
+        const std::vector<std::string> & to_quant,
+        const std::vector<std::string> & to_skip,
+        std::vector<float> & levels) {
+    const ggml_type T = ggml_ftype_to_ggml_type(ftype);
+    const int       NL = ggml_neuron_l_n_levels(T);
+    if (NL <= 0) {
+        return false;
+    }
+    const int    BLK    = (int) ggml_blck_size(T);
+    const size_t TSZ    = ggml_type_size(T);
+    const int    H      = NL / 2;
+    const size_t NBLK   = 32768;
+    // The recipe was measured at 16 levels. The weight floor is what the objective calls "small",
+    // so it is a property of the model, not of how many levels the codec has: tying it to H made
+    // every type fit a different objective. Overridable while that is being measured.
+    const int    ROUNDS = getenv("NEURON_FIT_ROUNDS") ? atoi(getenv("NEURON_FIT_ROUNDS")) : 12;
+    const float  ALPHA  = getenv("NEURON_FIT_ALPHA")  ? (float) atof(getenv("NEURON_FIT_ALPHA"))  : 2.5f;
+    const float  FLOOR  = getenv("NEURON_FIT_FLOOR")  ? (float) atof(getenv("NEURON_FIT_FLOOR"))  : 1.0f / 16.0f;
+
+    const std::streampos start = finp.tellg();
+
+    // one pass for where the weights are, so the sample can be spread over every layer
+    struct src_tensor { std::streampos off; int64_t nblk; int32_t ttype; };
+    std::vector<src_tensor> src;
+    while (true) {
+        int32_t n_dims, length, ttype;
+        finp.read(reinterpret_cast<char *>(&n_dims), sizeof(n_dims));
+        finp.read(reinterpret_cast<char *>(&length), sizeof(length));
+        finp.read(reinterpret_cast<char *>(&ttype),  sizeof(ttype));
+        if (finp.eof()) {
+            break;
+        }
+        int32_t nelements = 1;
+        int32_t ne[4] = { 1, 1, 1, 1 };
+        for (int i = 0; i < n_dims; ++i) {
+            finp.read(reinterpret_cast<char *>(&ne[i]), sizeof(ne[i]));
+            nelements *= ne[i];
+        }
+        std::string name(length, 0);
+        finp.read(&name[0], length);
+
+        bool quantize = false;
+        for (const auto & r : to_quant) {
+            if (std::regex_match(name, std::regex(r))) { quantize = true; break; }
+        }
+        for (const auto & r : to_skip) {
+            if (std::regex_match(name, std::regex(r))) { quantize = false; break; }
+        }
+        quantize &= (n_dims == 2) && (ttype == GGML_TYPE_F32 || ttype == GGML_TYPE_F16) && (ne[0] % BLK == 0);
+
+        const size_t bpe = (ttype == GGML_TYPE_F32) ? sizeof(float) : sizeof(uint16_t);
+        if (quantize) {
+            src.push_back({ finp.tellg(), nelements / BLK, ttype });
+        }
+        finp.seekg((size_t) nelements * bpe, std::ios::cur);
+    }
+    finp.clear();
+
+    if (src.empty()) {
+        finp.seekg(start);
+        return false;
+    }
+
+    // read only the sampled blocks, spread evenly through each tensor
+    const size_t per = std::max<size_t>(1, NBLK / src.size());
+    std::vector<float>       X;
+    std::vector<ggml_fp16_t> half(BLK);
+    X.reserve(NBLK * BLK);
+    for (const auto & t : src) {
+        const size_t take = std::min<size_t>(per, (size_t) t.nblk);
+        const size_t bpe  = (t.ttype == GGML_TYPE_F32) ? sizeof(float) : sizeof(uint16_t);
+        for (size_t s = 0; s < take; ++s) {
+            const size_t b = (size_t) ((double) s * t.nblk / take);
+            finp.seekg(t.off + (std::streamoff) (b * BLK * bpe));
+            X.resize(X.size() + BLK);
+            float * dst = X.data() + X.size() - BLK;
+            if (t.ttype == GGML_TYPE_F32) {
+                finp.read(reinterpret_cast<char *>(dst), BLK * sizeof(float));
+            } else {
+                finp.read(reinterpret_cast<char *>(half.data()), BLK * sizeof(ggml_fp16_t));
+                for (int i = 0; i < BLK; ++i) {
+                    dst[i] = ggml_fp16_to_fp32(half[i]);
+                }
+            }
+        }
+    }
+    finp.clear();
+    finp.seekg(start);
+
+    const size_t nb = X.size() / BLK;
+    if (nb == 0) {
+        return false;
+    }
+
+    std::vector<float> L(2 * H);
+    for (int j = 0; j < H; ++j) {
+        L[H + j]     =  (2.0f * j + 1.0f) / (2.0f * H - 1.0f);
+        L[H - 1 - j] = -L[H + j];
+    }
+    std::vector<uint8_t> q(nb * TSZ);
+    std::vector<float>   R(nb * BLK);
+    std::vector<uint8_t> nidx(nb * BLK);
+    ggml_quantize_init(T);
+
+    for (int r = 0; r < ROUNDS; ++r) {
+        ggml_neuron_l_set_levels(T, L.data());
+        ggml_quantize_chunk(T, X.data(), q.data(), 0, (int64_t) nb, BLK, nullptr);
+        ggml_get_type_traits(T)->to_float(q.data(), R.data(), (int64_t) nb * BLK);
+        ggml_neuron_l_get_indices(T, q.data(), (int64_t) nb * BLK, nidx.data());
+
+        // reconstruction is g * L[n] and no level is zero, so g = rec / L[n]
+        const float tfloor = FLOOR;
+        std::vector<double> num(H, 0.0), den(H, 0.0);
+        double sse = 0.0, tot = 0.0;
+        for (size_t i = 0; i < nb * (size_t) BLK; ++i) {
+            const float x = X[i];
+            const float y = R[i];
+            const int   n = nidx[i];
+            const int   j = n >= H ? n - H : H - 1 - n;
+            const float g = y / L[n];
+            const double e = (double) x - y;
+            sse += e * e;
+            tot += (double) x * x;
+            if (!(g > 0.0f)) {
+                continue;
+            }
+            const float w = std::pow(std::max(std::fabs(x) / g, tfloor), -ALPHA);
+            num[j] += (double) w * g * std::fabs(x);
+            den[j] += (double) w * g * g;
+        }
+        std::vector<float> mag(H);
+        for (int j = 0; j < H; ++j) {
+            mag[j] = den[j] > 0.0 ? (float) (num[j] / den[j]) : L[H + j];
+        }
+        std::sort(mag.begin(), mag.end());
+        for (int j = 0; j < H; ++j) {
+            L[H + j]     =  mag[j];
+            L[H - 1 - j] = -mag[j];
+        }
+        fprintf(stderr, "%s: round %2d  rel mse %.6e\n", __func__, r + 1, sse / std::max(tot, 1e-30));
+    }
+    // d and the levels share one scale, so state the table with its top at 1
+    const float top = L[2 * H - 1] > 0.0f ? L[2 * H - 1] : 1.0f;
+    for (float & v : L) {
+        v /= top;
+    }
+    fprintf(stderr, "%s: %s levels fitted on %zu blocks of this model\n", __func__, ggml_type_name(T), nb);
+    levels = L;
+    ggml_neuron_l_set_levels(T, levels.data());
+    return true;
 }
 
 bool ggml_common_quantize_0(
@@ -67,6 +231,7 @@ bool ggml_common_quantize_0(
         case GGML_FTYPE_MOSTLY_NEURON_L4: qtype = GGML_TYPE_NEURON_L4; break;
         case GGML_FTYPE_MOSTLY_NEURON_L5: qtype = GGML_TYPE_NEURON_L5; break;
         case GGML_FTYPE_MOSTLY_NEURON_L6: qtype = GGML_TYPE_NEURON_L6; break;
+        case GGML_FTYPE_MOSTLY_NEURON_L7: qtype = GGML_TYPE_NEURON_L7; break;
         case GGML_FTYPE_UNKNOWN:
         case GGML_FTYPE_ALL_F32:
         case GGML_FTYPE_MOSTLY_F16:
@@ -204,6 +369,7 @@ bool ggml_common_quantize_0(
                 case GGML_TYPE_NEURON_L4:
                 case GGML_TYPE_NEURON_L5:
                 case GGML_TYPE_NEURON_L6:
+                case GGML_TYPE_NEURON_L7:
                     {
                         cur_size = ggml_quantize_chunk((ggml_type) ttype, data_f32.data(), work.data(), 0, nelements/ne[0], ne[0], nullptr);
                     } break;

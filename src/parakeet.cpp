@@ -1218,6 +1218,25 @@ static bool parakeet_model_load(struct parakeet_model_loader * loader, parakeet_
             __func__, n_vocab, blank_id, vocab.token_unk, vocab.token_bos, vocab.token_eos);
     }
 
+    // lattice levels: part of the format, fitted on this model when it was quantized
+    if (ggml_neuron_l_n_levels(ggml_ftype_to_ggml_type((ggml_ftype) hparams.ftype)) > 0) {
+        const ggml_type lt = ggml_ftype_to_ggml_type((ggml_ftype) hparams.ftype);
+        int32_t n_levels = 0;
+        read_safe(loader, n_levels);
+        if (n_levels == 0) {
+            ggml_neuron_l_set_levels(lt, nullptr);
+        } else if (n_levels != ggml_neuron_l_n_levels(lt)) {
+            PARAKEET_LOG_ERROR("%s: %s needs %d levels, the file has %d\n", __func__,
+                    ggml_type_name(lt), ggml_neuron_l_n_levels(lt), n_levels);
+            return false;
+        } else {
+            std::vector<float> levels(n_levels);
+            loader->read(loader->context, levels.data(), levels.size() * sizeof(float));
+            ggml_neuron_l_set_levels(lt, levels.data());
+            PARAKEET_LOG_INFO("%s: bound this model's own %d %s levels\n", __func__, n_levels, ggml_type_name(lt));
+        }
+    }
+
     const ggml_type wtype = wctx.wtype;
 
 
