@@ -7339,7 +7339,10 @@ int whisper_full_with_state(
                 }
             }
 
-            for (int i = 0, n_max = whisper_n_text_ctx(ctx)/2 - 4; i < n_max; ++i) {
+            // the decoder holds n_text_ctx positions and the prompt takes the first of them; every token
+            // generated here is fed back at the next one. A script BPE spends several tokens per letter on
+            // (Telugu) needs the room: half the context cut such text off mid-sentence.
+            for (int i = 0, n_max = whisper_n_text_ctx(ctx) - (int) prompt.size(); i < n_max; ++i) {
                 const int64_t t_start_sample_us = ggml_time_us();
 
                 if (params.strategy == whisper_sampling_strategy::WHISPER_SAMPLING_BEAM_SEARCH) {
