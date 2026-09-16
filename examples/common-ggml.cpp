@@ -16,6 +16,8 @@ static const std::map<std::string, enum ggml_ftype> GGML_FTYPE_MAP = {
     {"q6_k", GGML_FTYPE_MOSTLY_Q6_K},
     {"neuron_v4", GGML_FTYPE_MOSTLY_NEURON_V4},
     {"neuron_l4", GGML_FTYPE_MOSTLY_NEURON_L4},
+    {"neuron_l5", GGML_FTYPE_MOSTLY_NEURON_L5},
+    {"neuron_l6", GGML_FTYPE_MOSTLY_NEURON_L6},
 };
 
 void ggml_print_ftypes(FILE * fp) {
@@ -63,6 +65,8 @@ bool ggml_common_quantize_0(
         case GGML_FTYPE_MOSTLY_Q6_K: qtype = GGML_TYPE_Q6_K; break;
         case GGML_FTYPE_MOSTLY_NEURON_V4: qtype = GGML_TYPE_NEURON_V4; break;
         case GGML_FTYPE_MOSTLY_NEURON_L4: qtype = GGML_TYPE_NEURON_L4; break;
+        case GGML_FTYPE_MOSTLY_NEURON_L5: qtype = GGML_TYPE_NEURON_L5; break;
+        case GGML_FTYPE_MOSTLY_NEURON_L6: qtype = GGML_TYPE_NEURON_L6; break;
         case GGML_FTYPE_UNKNOWN:
         case GGML_FTYPE_ALL_F32:
         case GGML_FTYPE_MOSTLY_F16:
@@ -198,6 +202,8 @@ bool ggml_common_quantize_0(
                 case GGML_TYPE_Q6_K:
                 case GGML_TYPE_NEURON_V4:
                 case GGML_TYPE_NEURON_L4:
+                case GGML_TYPE_NEURON_L5:
+                case GGML_TYPE_NEURON_L6:
                     {
                         cur_size = ggml_quantize_chunk((ggml_type) ttype, data_f32.data(), work.data(), 0, nelements/ne[0], ne[0], nullptr);
                     } break;

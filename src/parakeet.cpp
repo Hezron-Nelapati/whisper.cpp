@@ -270,8 +270,9 @@ struct parakeet_sched {
 // TODO: Find out is there a multiple version types. It is not yet clear to me
 // at this point.
 enum parakeet_arch {
-    PARAKEET_ARCH_UNKNOWN = 0,
-    PARAKEET_ARCH_TDT     = 1,  // NVIDIA Parakeet TDT (RNN-T)
+    PARAKEET_ARCH_UNKNOWN       = 0,
+    PARAKEET_ARCH_TDT           = 1,  // NVIDIA Parakeet TDT (RNN-T)
+    PARAKEET_ARCH_CONFORMER_RNNT = 2, // AI4Bharat IndicConformer (plain RNN-T)
 };
 
 struct parakeet_hparams {
@@ -301,6 +302,8 @@ struct parakeet_layer_encoder {
 
     struct ggml_tensor * ff1_linear1_w = nullptr;
     struct ggml_tensor * ff1_linear2_w = nullptr;
+    struct ggml_tensor * ff1_linear1_b = nullptr;  // IndicConformer only
+    struct ggml_tensor * ff1_linear2_b = nullptr;  // IndicConformer only
 
     struct ggml_tensor * norm_conv_w = nullptr;
     struct ggml_tensor * norm_conv_b = nullptr;
@@ -313,6 +316,9 @@ struct parakeet_layer_encoder {
     struct ggml_tensor * conv_bn_var         = nullptr;  // batch_norm running_var
     struct ggml_tensor * conv_bn_num_batches = nullptr;  // batch_norm num_batches_tracked
     struct ggml_tensor * conv_pw2_w          = nullptr;  // pointwise_conv2
+    struct ggml_tensor * conv_pw1_b          = nullptr;  // IndicConformer only
+    struct ggml_tensor * conv_dw_b           = nullptr;  // IndicConformer only
+    struct ggml_tensor * conv_pw2_b          = nullptr;  // IndicConformer only
 
     struct ggml_tensor * norm_attn_w = nullptr;
     struct ggml_tensor * norm_attn_b = nullptr;
@@ -324,12 +330,18 @@ struct parakeet_layer_encoder {
     struct ggml_tensor * attn_v_w        = nullptr;
     struct ggml_tensor * attn_out_w      = nullptr;
     struct ggml_tensor * attn_pos_w      = nullptr;
+    struct ggml_tensor * attn_q_b        = nullptr;  // IndicConformer only
+    struct ggml_tensor * attn_k_b        = nullptr;  // IndicConformer only
+    struct ggml_tensor * attn_v_b        = nullptr;  // IndicConformer only
+    struct ggml_tensor * attn_out_b      = nullptr;  // IndicConformer only
 
     struct ggml_tensor * norm_ff2_w      = nullptr;
     struct ggml_tensor * norm_ff2_b      = nullptr;
 
     struct ggml_tensor * ff2_linear1_w = nullptr;
     struct ggml_tensor * ff2_linear2_w = nullptr;
+    struct ggml_tensor * ff2_linear1_b = nullptr;  // IndicConformer only
+    struct ggml_tensor * ff2_linear2_b = nullptr;  // IndicConformer only
 
     struct ggml_tensor * norm_out_w = nullptr;
     struct ggml_tensor * norm_out_b = nullptr;
@@ -686,8 +698,9 @@ static void read_safe(parakeet_model_loader * loader, T & dest) {
 }
 
 
-static bool parakeet_validate_hparams(const std::map<parakeet_hparam, int32_t> & hparam_values) {
-    for (const auto & hparam_expected : PARAKEET_HPARAM_MODEL_VALUES) {
+static bool parakeet_validate_hparams(const std::map<parakeet_hparam, int32_t> & hparam_values,
+                                      const std::map<parakeet_hparam, int32_t> & hparam_limits) {
+    for (const auto & hparam_expected : hparam_limits) {
         const parakeet_hparam hparam = hparam_expected.first;
         const auto hparam_value = hparam_values.find(hparam);
         if (hparam_value == hparam_values.end()) {
@@ -1055,11 +1068,14 @@ static bool parakeet_model_load(struct parakeet_model_loader * loader, parakeet_
         read_hparam(PARAKEET_HPARAM_N_TDT_DURATIONS, hparams.n_tdt_durations);
         read_hparam(PARAKEET_HPARAM_N_MAX_TOKENS, hparams.n_max_tokens);
 
-        if(!parakeet_validate_hparams(hparam_values)) {
+        // a transducer with no duration head is an IndicConformer, not a Parakeet TDT
+        hparams.arch = hparams.n_tdt_durations == 0 ? PARAKEET_ARCH_CONFORMER_RNNT : PARAKEET_ARCH_TDT;
+
+        if(!parakeet_validate_hparams(hparam_values, hparams.arch == PARAKEET_ARCH_CONFORMER_RNNT
+                    ? PARAKEET_HPARAM_CONFORMER_VALUES : PARAKEET_HPARAM_MODEL_VALUES)) {
             return false;
         }
 
-        hparams.arch = PARAKEET_ARCH_TDT;
         wctx.model.hparams = hparams;
 
         const int32_t qntvr = hparams.ftype / GGML_QNT_VERSION_FACTOR;
@@ -1074,7 +1090,9 @@ static bool parakeet_model_load(struct parakeet_model_loader * loader, parakeet_
             return false;
         }
 
-        const char* arch_name = hparams.arch == PARAKEET_ARCH_TDT ? "Parakeet TDT" : "unknown";
+        const char* arch_name = hparams.arch == PARAKEET_ARCH_TDT           ? "Parakeet TDT"
+                              : hparams.arch == PARAKEET_ARCH_CONFORMER_RNNT ? "IndicConformer RNN-T"
+                              : "unknown";
         PARAKEET_LOG_INFO("%s: arch                   = %s\n", __func__, arch_name);
         PARAKEET_LOG_INFO("%s: n_vocab                = %d\n", __func__, hparams.n_vocab);
         PARAKEET_LOG_INFO("%s: n_audio_ctx            = %d\n", __func__, hparams.n_audio_ctx);
@@ -1205,8 +1223,11 @@ static bool parakeet_model_load(struct parakeet_model_loader * loader, parakeet_
 
     const int n_audio_layer = hparams.n_audio_layer;
 
-    // Calculate tensor count: pre_encode (12) + encoder layers (29 per layer) + prediction (9) + joint (6)
-    size_t n_tensors = 12 + (29 * n_audio_layer) + 9 + 6;
+    const bool is_conformer = hparams.arch == PARAKEET_ARCH_CONFORMER_RNNT;
+
+    // Calculate tensor count: pre_encode (12) + encoder layers (29 per layer) + prediction (9) + joint (6).
+    // The IndicConformer has 4 pre_encode tensors and 11 more per layer (biased projections).
+    size_t n_tensors = 12 + ((is_conformer ? 40 : 29) * n_audio_layer) + 9 + 6;
 
     std::map<ggml_backend_buffer_type_t, ggml_context *> ctx_map;
     auto get_ctx = [&](ggml_backend_buffer_type_t buft) -> ggml_context * {
@@ -1285,11 +1306,15 @@ static bool parakeet_model_load(struct parakeet_model_loader * loader, parakeet_
     model.enc_pre_conv_0_b = create_tensor(PARAKEET_TENSOR_ENC_PRE_CONV_0_BIAS, ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1, 1, n_subsampling_channels, 1));
     ggml_set_name(model.enc_pre_conv_0_b, "enc_pre_conv_0_b");
 
-    model.enc_pre_conv_2_w = create_tensor(PARAKEET_TENSOR_ENC_PRE_CONV_2_WEIGHT, ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 3, 3, 1, n_subsampling_channels));
+    // striding subsampling is two plain convolutions; dw_striding interleaves depthwise and pointwise ones
+    model.enc_pre_conv_2_w = create_tensor(PARAKEET_TENSOR_ENC_PRE_CONV_2_WEIGHT, is_conformer
+            ? ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 3, 3, n_subsampling_channels, n_subsampling_channels)
+            : ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 3, 3, 1, n_subsampling_channels));
     ggml_set_name(model.enc_pre_conv_2_w, "enc_pre_conv_2_w");
     model.enc_pre_conv_2_b = create_tensor(PARAKEET_TENSOR_ENC_PRE_CONV_2_BIAS, ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1, 1, n_subsampling_channels, 1));
     ggml_set_name(model.enc_pre_conv_2_b, "enc_pre_conv_2_b");
 
+    if (!is_conformer) {
     model.enc_pre_conv_3_w = create_tensor(PARAKEET_TENSOR_ENC_PRE_CONV_3_WEIGHT, ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1, 1, n_subsampling_channels, n_subsampling_channels));
     ggml_set_name(model.enc_pre_conv_3_w, "enc_pre_conv_3_w");
     model.enc_pre_conv_3_b = create_tensor(PARAKEET_TENSOR_ENC_PRE_CONV_3_BIAS, ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1, 1, n_subsampling_channels, 1));
@@ -1304,6 +1329,7 @@ static bool parakeet_model_load(struct parakeet_model_loader * loader, parakeet_
     ggml_set_name(model.enc_pre_conv_6_w, "enc_pre_conv_6_w");
     model.enc_pre_conv_6_b = create_tensor(PARAKEET_TENSOR_ENC_PRE_CONV_6_BIAS, ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1, 1, n_subsampling_channels, 1));
     ggml_set_name(model.enc_pre_conv_6_b, "enc_pre_conv_6_b");
+    }
 
     // Encoder layers
     for (int i = 0; i < n_audio_layer; ++i) {
@@ -1358,6 +1384,25 @@ static bool parakeet_model_load(struct parakeet_model_loader * loader, parakeet_
         // Output norm
         layer.norm_out_w = create_tensor(PARAKEET_TENSOR_ENC_NORM_OUT_WEIGHT, ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_audio_state), i);
         layer.norm_out_b = create_tensor(PARAKEET_TENSOR_ENC_NORM_OUT_BIAS, ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_audio_state), i);
+
+        if (!is_conformer) {
+            continue;
+        }
+
+        // the IndicConformer keeps a bias on every projection in the layer
+        layer.ff1_linear1_b = create_tensor(PARAKEET_TENSOR_ENC_FF1_LINEAR1_BIAS, ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 4*n_audio_state), i);
+        layer.ff1_linear2_b = create_tensor(PARAKEET_TENSOR_ENC_FF1_LINEAR2_BIAS, ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_audio_state), i);
+        layer.ff2_linear1_b = create_tensor(PARAKEET_TENSOR_ENC_FF2_LINEAR1_BIAS, ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 4*n_audio_state), i);
+        layer.ff2_linear2_b = create_tensor(PARAKEET_TENSOR_ENC_FF2_LINEAR2_BIAS, ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_audio_state), i);
+
+        layer.conv_pw1_b = create_tensor(PARAKEET_TENSOR_ENC_CONV_PW1_BIAS, ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 2*n_audio_state), i);
+        layer.conv_dw_b  = create_tensor(PARAKEET_TENSOR_ENC_CONV_DW_BIAS,  ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_audio_state), i);
+        layer.conv_pw2_b = create_tensor(PARAKEET_TENSOR_ENC_CONV_PW2_BIAS, ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_audio_state), i);
+
+        layer.attn_q_b   = create_tensor(PARAKEET_TENSOR_ENC_ATTN_Q_BIAS,   ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_audio_state), i);
+        layer.attn_k_b   = create_tensor(PARAKEET_TENSOR_ENC_ATTN_K_BIAS,   ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_audio_state), i);
+        layer.attn_v_b   = create_tensor(PARAKEET_TENSOR_ENC_ATTN_V_BIAS,   ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_audio_state), i);
+        layer.attn_out_b = create_tensor(PARAKEET_TENSOR_ENC_ATTN_OUT_BIAS, ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_audio_state), i);
     }
 
     // Prediction network (decoder)
@@ -1555,6 +1600,15 @@ static struct ggml_cgraph * parakeet_build_graph_encode(parakeet_context & pctx,
     cur = ggml_relu(ctx0, cur);
     ggml_set_name(cur, "pre_conv_0_relu");
 
+    if (hparams.arch == PARAKEET_ARCH_CONFORMER_RNNT) {
+        // striding: a second plain convolution, halving time and frequency again
+        cur = ggml_conv_2d(ctx0, model.enc_pre_conv_2_w, cur, 2, 2, 1, 1, 1, 1);
+        cur = ggml_add(ctx0, cur, model.enc_pre_conv_2_b);
+        ggml_set_name(cur, "pre_conv_2");
+
+        cur = ggml_relu(ctx0, cur);
+        ggml_set_name(cur, "pre_conv_2_relu");
+    } else {
     // [freq, time, channels, batch]
     cur = ggml_conv_2d_dw_direct(ctx0, model.enc_pre_conv_2_w, cur, 2, 2, 1, 1, 1, 1);
     cur = ggml_add(ctx0, cur, model.enc_pre_conv_2_b);
@@ -1581,6 +1635,7 @@ static struct ggml_cgraph * parakeet_build_graph_encode(parakeet_context & pctx,
 
     cur = ggml_relu(ctx0, cur);
     ggml_set_name(cur, "pre_conv_6_relu");
+    }
 
     // [freq, time, chan]
     cur = ggml_permute(ctx0, cur, 0, 2, 1, 3);
@@ -1596,6 +1651,11 @@ static struct ggml_cgraph * parakeet_build_graph_encode(parakeet_context & pctx,
 
     cur = ggml_mul_mat(ctx0, model.enc_pre_out_w, cur);
     cur = ggml_add(ctx0, cur, model.enc_pre_out_b);
+
+    if (hparams.arch == PARAKEET_ARCH_CONFORMER_RNNT) {
+        // xscaling: the positional encoder scales the input by sqrt(d_model)
+        cur = ggml_scale(ctx0, cur, std::sqrt((float) n_state));
+    }
 
     ggml_set_name(cur, "pre_enc_out");
 
@@ -1655,10 +1715,16 @@ static struct ggml_cgraph * parakeet_build_graph_encode(parakeet_context & pctx,
 
             // ffn_1
             cur = ggml_mul_mat(ctx0, layer.ff1_linear1_w, cur);
+            if (layer.ff1_linear1_b) {
+                cur = ggml_add(ctx0, cur, layer.ff1_linear1_b);
+            }
             cur = ggml_silu(ctx0, cur);
             ggml_format_name(cur, "enc_%d_silu", il);
 
             cur = ggml_mul_mat(ctx0, layer.ff1_linear2_w, cur);
+            if (layer.ff1_linear2_b) {
+                cur = ggml_add(ctx0, cur, layer.ff1_linear2_b);
+            }
             ggml_format_name(cur, "enc_%d_ffn_1", il);
 
             cur = ggml_add(ctx0, residual, ggml_scale(ctx0, cur, fc_factor));
@@ -1681,6 +1747,12 @@ static struct ggml_cgraph * parakeet_build_graph_encode(parakeet_context & pctx,
             struct ggml_tensor * Q_cur = ggml_mul_mat(ctx0, layer.attn_q_w, cur);
             struct ggml_tensor * K_cur = ggml_mul_mat(ctx0, layer.attn_k_w, cur);
             struct ggml_tensor * V_cur = ggml_mul_mat(ctx0, layer.attn_v_w, cur);
+
+            if (layer.attn_q_b) {
+                Q_cur = ggml_add(ctx0, Q_cur, layer.attn_q_b);
+                K_cur = ggml_add(ctx0, K_cur, layer.attn_k_b);
+                V_cur = ggml_add(ctx0, V_cur, layer.attn_v_b);
+            }
 
             Q_cur = ggml_reshape_3d(ctx0, Q_cur, d_head, n_head, n_time);
             K_cur = ggml_reshape_3d(ctx0, K_cur, d_head, n_head, n_time);
@@ -1813,6 +1885,9 @@ static struct ggml_cgraph * parakeet_build_graph_encode(parakeet_context & pctx,
                 cur = ggml_cont(ctx0, ggml_permute(ctx0, cur, 0, 2, 1, 3));
                 cur = ggml_reshape_2d(ctx0, cur, n_state, n_time);
                 cur = ggml_mul_mat(ctx0, layer.attn_out_w, cur);
+                if (layer.attn_out_b) {
+                    cur = ggml_add(ctx0, cur, layer.attn_out_b);
+                }
             } else {
                 struct ggml_tensor * Q_u = ggml_add(ctx0, Q_cur, layer.attn_pos_bias_u);
                 ggml_format_name(Q_u, "enc_%d_attn_q_u", il);
@@ -1885,6 +1960,9 @@ static struct ggml_cgraph * parakeet_build_graph_encode(parakeet_context & pctx,
                 cur = ggml_permute(ctx0, cur, 2, 0, 1, 3);
                 cur = ggml_cont_2d(ctx0, cur, n_state, n_time);
                 cur = ggml_mul_mat(ctx0, layer.attn_out_w, cur);
+                if (layer.attn_out_b) {
+                    cur = ggml_add(ctx0, cur, layer.attn_out_b);
+                }
             }
             ggml_format_name(cur, "enc_%d_attn_out", il);
 
@@ -1903,6 +1981,9 @@ static struct ggml_cgraph * parakeet_build_graph_encode(parakeet_context & pctx,
 
             // pointwise 1d convolution: [1024, 138] -> [2048, 138]
             cur = ggml_mul_mat(ctx0, layer.conv_pw1_w, cur);
+            if (layer.conv_pw1_b) {
+                cur = ggml_add(ctx0, cur, layer.conv_pw1_b);
+            }
             ggml_format_name(cur, "enc_%d_conv_pw1", il);
 
             {
@@ -1924,6 +2005,9 @@ static struct ggml_cgraph * parakeet_build_graph_encode(parakeet_context & pctx,
             ggml_format_name(cur, "enc_%d_conv_dw_pad", il);
 
             cur = ggml_ssm_conv(ctx0, cur, layer.conv_dw_w);
+            if (layer.conv_dw_b) {
+                cur = ggml_add(ctx0, cur, layer.conv_dw_b);
+            }
             ggml_format_name(cur, "enc_%d_conv_1d_dw", il);
 
             cur = ggml_sub(ctx0, cur, layer.conv_bn_mean);
@@ -1936,6 +2020,9 @@ static struct ggml_cgraph * parakeet_build_graph_encode(parakeet_context & pctx,
             ggml_format_name(cur, "enc_%d_conv_silu", il);
 
             cur = ggml_mul_mat(ctx0, layer.conv_pw2_w, cur);
+            if (layer.conv_pw2_b) {
+                cur = ggml_add(ctx0, cur, layer.conv_pw2_b);
+            }
             ggml_format_name(cur, "enc_%d_conv_pw2", il);
 
             cur = ggml_add(ctx0, residual, cur);
@@ -1950,8 +2037,14 @@ static struct ggml_cgraph * parakeet_build_graph_encode(parakeet_context & pctx,
             ggml_format_name(cur, "enc_%d_ffn_norm_2", il);
 
             cur = ggml_mul_mat(ctx0, layer.ff2_linear1_w, cur);
+            if (layer.ff2_linear1_b) {
+                cur = ggml_add(ctx0, cur, layer.ff2_linear1_b);
+            }
             cur = ggml_silu(ctx0, cur);
             cur = ggml_mul_mat(ctx0, layer.ff2_linear2_w, cur);
+            if (layer.ff2_linear2_b) {
+                cur = ggml_add(ctx0, cur, layer.ff2_linear2_b);
+            }
             cur = ggml_add(ctx0, residual, ggml_scale(ctx0, cur, 0.5));
             ggml_format_name(cur, "enc_%d_ffn_res", il);
         }
@@ -2567,16 +2660,22 @@ static bool parakeet_decode(
         // find the max index of the duration logits, and look up that index
         // value in the tdt_durations array to get the actual duration value.
         int best_duration_idx = 0;
-        float best_duration_logit = pstate.logits[n_vocab_logits];
-        for (int i = 1; i < n_tdt_durations; ++i) {
-            if (pstate.logits[n_vocab_logits + i] > best_duration_logit) {
-                best_duration_logit = pstate.logits[n_vocab_logits + i];
-                best_duration_idx = i;
+        int duration = 0;
+        if (n_tdt_durations == 0) {
+            // plain transducer: blank advances one frame, a token stays on this one
+            duration = best_token == blank_id ? 1 : 0;
+        } else {
+            float best_duration_logit = pstate.logits[n_vocab_logits];
+            for (int i = 1; i < n_tdt_durations; ++i) {
+                if (pstate.logits[n_vocab_logits + i] > best_duration_logit) {
+                    best_duration_logit = pstate.logits[n_vocab_logits + i];
+                    best_duration_idx = i;
+                }
             }
+            // look up that max duration index value in the tdt_durations array to
+            // get the actual duration value.
+            duration = tdt_durations[best_duration_idx];
         }
-        // look up that max duration index value in the tdt_durations array to
-        // get the actual duration value.
-        int duration = tdt_durations[best_duration_idx];
 
         if (best_token == blank_id) {
             if (duration == 0) {
@@ -2596,8 +2695,9 @@ static bool parakeet_decode(
         pstate.n_sample++;
 
         parakeet_token_data token_data = create_token_data(
-            pctx, pstate, best_token, best_duration_idx, duration, t,
-            max_logit, n_vocab_logits);
+            pctx, pstate, best_token, best_duration_idx,
+            n_tdt_durations == 0 ? 1 : duration,   // a plain transducer gives no duration; span one frame
+            t, max_logit, n_vocab_logits);
 
         pstate.decoded_token_data.push_back(token_data);
 
