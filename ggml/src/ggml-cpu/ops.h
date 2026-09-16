@@ -6,16 +6,13 @@
 // cache line
 //
 
-#if defined(__cpp_lib_hardware_interference_size)
-#define CACHE_LINE_SIZE std::hardware_destructive_interference_size
-#else
+// one value for C and C++: ggml-cpu.c pads the work buffer by it and ops.cpp spaces per-thread scratch by it (std::hardware_destructive_interference_size is 256 with Apple clang)
 #if defined(__POWER9_VECTOR__)
 #define CACHE_LINE_SIZE 128
 #elif defined(__VXE__) || defined(__VXE2__)
 #define CACHE_LINE_SIZE 256
 #else
 #define CACHE_LINE_SIZE 64
-#endif
 #endif
 
 static const size_t CACHE_LINE_SIZE_F32 = CACHE_LINE_SIZE/sizeof(float);
